@@ -525,6 +525,71 @@
   });
 
   // ---------- aerodynamics ----------
+  // The fold engine can now produce genuinely concave outlines (notches,
+  // tucked-under flaps, protruding corners). A couple of the original
+  // heuristics assumed a roughly convex, hull-like shape and need to be
+  // made robust to that; this also adds the "mass distribution along the
+  // length" heuristic from Модуль 4 of the spec, which wasn't implemented.
+
+  // Exact area centroid via the standard polygon-centroid formula (valid
+  // for any simple polygon, convex or concave) — used both for scoring and
+  // for pivoting the plane silhouette in the slope-test animation.
+  function polygonCentroid(pts){
+    let a=0, cx=0, cy=0;
+    for(let i=0;i<pts.length;i++){
+      const p=pts[i], q=pts[(i+1)%pts.length];
+      const cross = p.x*q.y - q.x*p.y;
+      a += cross;
+      cx += (p.x+q.x)*cross;
+      cy += (p.y+q.y)*cross;
+    }
+    a *= 0.5;
+    if(Math.abs(a) < 1e-6){
+      const n = pts.length || 1;
+      return { x: pts.reduce((s,p)=>s+p.x,0)/n, y: pts.reduce((s,p)=>s+p.y,0)/n };
+    }
+    return { x: cx/(6*a), y: cy/(6*a) };
+  }
+
+  // Left/right (or top/bottom) area balance across the centerline. A
+  // half-plane clip assumes the cutting line crosses the boundary exactly
+  // twice, which convex hulls always satisfied but a concave silhouette
+  // with several notches along its length may not — so this samples the
+  // polygon on a grid instead, which stays correct for any simple polygon.
+  function estimateSymmetry(pts, mainAxisX, centerline, minX, maxX, minY, maxY){
+    const GRID = 40;
+    const stepX = Math.max((maxX-minX)/GRID, 0.001);
+    const stepY = Math.max((maxY-minY)/GRID, 0.001);
+    let sideA=0, sideB=0;
+    for(let i=0;i<GRID;i++){
+      const px = minX + (i+0.5)*stepX;
+      for(let j=0;j<GRID;j++){
+        const py = minY + (j+0.5)*stepY;
+        if(!pointInPolygon({x:px,y:py}, pts)) continue;
+        const onA = mainAxisX ? py < centerline : px < centerline;
+        if(onA) sideA++; else sideB++;
+      }
+    }
+    const total = sideA+sideB;
+    return total>0 ? 1 - Math.abs(sideA-sideB)/total : 0;
+  }
+
+  // Prefer, among the vertices at (or very near) the extreme front, the one
+  // closest to the centerline — a stray protruding flap corner can now tie
+  // or beat the true symmetric nose tip on raw extremity alone.
+  function pickNose(pts, mainAxisX, minX, maxX, minY, maxY){
+    const extreme = mainAxisX ? minX : minY;
+    const tol = 6;
+    const candidates = pts.filter(p => (mainAxisX ? p.x : p.y) <= extreme+tol);
+    if(candidates.length<=1) return candidates[0] || pts[0];
+    const midY = (minY+maxY)/2, midX = (minX+maxX)/2;
+    return candidates.slice().sort((a,b)=>{
+      const da = mainAxisX ? Math.abs(a.y-midY) : Math.abs(a.x-midX);
+      const db = mainAxisX ? Math.abs(b.y-midY) : Math.abs(b.x-midX);
+      return da-db;
+    })[0];
+  }
+
   function evaluateFlight(pts){
     const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
     const minX=Math.min(...xs), maxX=Math.max(...xs);
@@ -535,13 +600,7 @@
     const length = mainAxisX ? width : height;
     const span = mainAxisX ? height : width;
 
-    // nose = extreme point along main axis (front)
-    let nose;
-    if(mainAxisX){
-      nose = pts.reduce((a,b)=> b.x<a.x ? b : a);
-    } else {
-      nose = pts.reduce((a,b)=> b.y<a.y ? b : a);
-    }
+    const nose = pickNose(pts, mainAxisX, minX, maxX, minY, maxY);
     const idx = pts.indexOf(nose);
     const prev = pts[(idx-1+pts.length)%pts.length];
     const next = pts[(idx+1)%pts.length];
@@ -549,23 +608,29 @@
     const angle = Math.acos(Math.max(-1,Math.min(1,dot(v1,v2)))) * 180/Math.PI;
     const noseScore = Math.max(0, Math.min(1, 1 - angle/140));
 
-    // symmetry across the centerline perpendicular to main axis
+    // symmetry across the centerline perpendicular to the main axis
     const centerline = mainAxisX ? (minY+maxY)/2 : (minX+maxX)/2;
-    const linePoint = mainAxisX ? {x:0,y:centerline} : {x:centerline,y:0};
-    const normal = mainAxisX ? {x:0,y:1} : {x:1,y:0};
-    const halfA = clipHalfPlane(pts, linePoint, normal, true);
-    const halfB = clipHalfPlane(pts, linePoint, normal, false);
-    const areaA = polygonArea(halfA), areaB = polygonArea(halfB);
-    const symmetry = (areaA+areaB)>0 ? 1 - Math.abs(areaA-areaB)/(areaA+areaB) : 0;
+    const symmetry = estimateSymmetry(pts, mainAxisX, centerline, minX, maxX, minY, maxY);
 
     const elongation = span>0 ? length/span : 0;
     const elongationScore = Math.max(0, Math.min(1, 1 - Math.abs(elongation-2.6)/2.6));
 
-    const score = 0.4*symmetry + 0.3*noseScore + 0.3*elongationScore;
-    const distance = Math.round(8 + score*40);
-    const wobble = Math.round((1-symmetry)*30);
+    // where the paper's area is concentrated along the nose-to-tail axis —
+    // a glider wants its center of area a bit forward of the midpoint for
+    // pitch stability; too nose-heavy or too tail-heavy both wobble more.
+    const centroid = polygonCentroid(pts);
+    const alongNose = mainAxisX ? minX : minY;
+    const alongTail = mainAxisX ? maxX : maxY;
+    const alongCentroid = mainAxisX ? centroid.x : centroid.y;
+    const massFrac = (alongCentroid - alongNose) / ((alongTail-alongNose) || 1);
+    const idealMassFrac = 0.44;
+    const massScore = Math.max(0, Math.min(1, 1 - Math.abs(massFrac-idealMassFrac)/idealMassFrac));
 
-    return {score, distance, wobble, symmetry, noseScore, elongationScore, mainAxisX};
+    const score = 0.32*symmetry + 0.24*noseScore + 0.24*elongationScore + 0.20*massScore;
+    const distance = Math.round(8 + score*40);
+    const wobble = Math.round((1-symmetry)*20 + (1-massScore)*10);
+
+    return {score, distance, wobble, symmetry, noseScore, elongationScore, massScore, massFrac, mainAxisX};
   }
 
   function updateReadout(text){
@@ -613,8 +678,8 @@
       ctx.translate(planeX, planeY);
       ctx.rotate(planeAngle);
       ctx.scale(0.35,0.35);
-      const cxp = shape.reduce((s,p)=>s+p.x,0)/shape.length;
-      const cyp = shape.reduce((s,p)=>s+p.y,0)/shape.length;
+      const planeCentroid = polygonCentroid(shape);
+      const cxp = planeCentroid.x, cyp = planeCentroid.y;
       ctx.beginPath();
       shape.forEach((p,i)=>{
         const lx=p.x-cxp, ly=p.y-cyp;
@@ -645,7 +710,7 @@
       if(t<1){
         requestAnimationFrame(frame);
       } else {
-        updateReadout(`Дальность полёта: ${result.distance} м  •  устойчивость: ${Math.round(result.symmetry*100)}%  •  острота носа: ${Math.round(result.noseScore*100)}%`);
+        updateReadout(`Дальность полёта: ${result.distance} м  •  симметрия: ${Math.round(result.symmetry*100)}%  •  острота носа: ${Math.round(result.noseScore*100)}%  •  баланс массы: ${Math.round(result.massScore*100)}%`);
       }
     }
     requestAnimationFrame(frame);
