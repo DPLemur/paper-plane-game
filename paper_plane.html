@@ -80,6 +80,23 @@
     color:#96907e;
     margin-top:4px;
   }
+  .section-title{
+    font-size:.95rem;
+    font-weight:600;
+    margin:28px 0 10px;
+    color:var(--ink);
+  }
+  .stage3d canvas{ cursor:grab; }
+  .stage3d canvas:active{ cursor:grabbing; }
+  .spread-row{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    margin-top:14px;
+    font-size:.85rem;
+  }
+  .spread-row input[type=range]{ width:200px; }
+  .spread-row span{ min-width:2.4em; color:#4a463c; }
 </style>
 </head>
 <body>
@@ -101,6 +118,18 @@
   <div class="readout" id="readout"></div>
   <div class="hint">Захватывай именно уголки листа — маленькие точки на контуре.</div>
 
+  <h2 class="section-title">3D-модель собранного листа</h2>
+  <div class="stage stage3d">
+    <canvas id="scene3d" width="480" height="360"></canvas>
+  </div>
+  <div class="spread-row">
+    <label for="spreadSlider">Раскрытие складок</label>
+    <input type="range" id="spreadSlider" min="0" max="100" value="0">
+    <span id="spreadValue">0%</span>
+  </div>
+  <div class="hint">Тяни мышкой по 3D-модели, чтобы покрутить камеру.</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 (function(){
   "use strict";
@@ -189,8 +218,95 @@
   let dragIndex = -1;
   let dragTarget = null;
 
+  // ---------- 3D panel/hinge model ----------
+  // The flat 2D silhouette above stays authoritative for fold interaction
+  // and for the aerodynamics heuristics — it's simple, well-tested, and the
+  // spec itself says folds should still be computed in the flat 2D plane.
+  // Alongside it we track how the sheet is actually built out of flat
+  // panels connected by hinges, purely so it can be shown folded up in real
+  // 3D and "sprung open" a little at the end (giving genuine dihedral
+  // angles), instead of always lying flattened on one plane.
+  //
+  // Every fold cuts ALL existing panels by the same line: whatever piece of
+  // a panel ends up on the dragged-corner side is reflected in 2D (as
+  // before) but is ALSO kept in its pre-fold, unreflected form together
+  // with the hinge line — that's enough to place it at any fold angle in
+  // 3D later (180° reflection is just a special case of rotating the flap
+  // 180° around the crease line, in the plane it started in).
+  let panels = [{ poly2d: shape.map(p=>({x:p.x,y:p.y})), hingeChain: [] }];
+  let hinges = []; // { axisP:{x,y}, axisDir:{x,y}(unit), angle(deg), ancestorChain:[hinge idx,...] }
+
+  function clonePanels(ps){
+    return ps.map(p=>({ poly2d: p.poly2d.map(pt=>({x:pt.x,y:pt.y})), hingeChain: p.hingeChain.slice() }));
+  }
+  function cloneHinges(hs){
+    return hs.map(h=>({ axisP:{x:h.axisP.x,y:h.axisP.y}, axisDir:{x:h.axisDir.x,y:h.axisDir.y}, angle:h.angle, ancestorChain:h.ancestorChain.slice() }));
+  }
+
+  // Cut every current panel by the same (M, normal) half-plane the 2D fold
+  // just used, and record a new hinge for whatever moved to the dragged
+  // corner's side. A panel that straddles the line is split in two, one
+  // piece staying and one becoming part of the new hinge's flap — exactly
+  // what happens physically to every layer of paper caught in a fold.
+  //
+  // A panel's `poly2d` is stored fully "unwound" — i.e. at angle 0 for
+  // EVERY hinge in its chain, not just the last — because pointFromChain-
+  // WithAxes always replays the whole chain from scratch. Since M/normal
+  // describe the CURRENT (fully closed) 2D silhouette, every existing
+  // panel must first be placed at its current closed-world position before
+  // being cut by that line (or a panel that already moved would get
+  // sliced in the wrong place), and every result must then be unwound back
+  // through that same chain before being stored (or replaying the chain
+  // later would apply its earlier hinges twice). Any live "spread" from
+  // the slider is display-only and is ignored here — folding always
+  // reasons about the flat, closed paper.
+  function applyFoldToPanels(M, normal){
+    const axesClosed = computeWorldAxesWithAngles(()=>180);
+    const newHingeIndex = hinges.length;
+    const newPanels = [];
+    let ancestorChain = null;
+    panels.forEach(panel=>{
+      const worldPoly = panel.poly2d.map(pt=>{
+        const w = pointFromChainWithAxes(pt, panel.hingeChain, axesClosed, ()=>180);
+        return {x:w.x, y:w.y};
+      });
+      const stayWorld = clipHalfPlane(worldPoly, M, normal, true);
+      const moveWorld = clipHalfPlane(worldPoly, M, normal, false);
+      const stayOk = stayWorld.length>=3 && polygonArea(stayWorld)>0.75;
+      const moveOk = moveWorld.length>=3 && polygonArea(moveWorld)>0.75;
+      if(stayOk){
+        const localStay = stayWorld.map(pt=> undoClosedChain(pt, panel.hingeChain, axesClosed));
+        newPanels.push({ poly2d: localStay, hingeChain: panel.hingeChain.slice() });
+        if(ancestorChain===null) ancestorChain = panel.hingeChain.slice();
+      }
+      if(moveOk){
+        // unwind through the panel's EXISTING chain only — the new hinge
+        // itself hasn't acted yet, so this is already its correct angle-0
+        // shape for the longer chain (existing chain + this new hinge).
+        const localMove = moveWorld.map(pt=> undoClosedChain(pt, panel.hingeChain, axesClosed));
+        newPanels.push({ poly2d: localMove, hingeChain: panel.hingeChain.concat(newHingeIndex) });
+      }
+      if(!stayOk && !moveOk){
+        // degenerate sliver under this cut — keep the panel untouched
+        // rather than silently lose paper.
+        newPanels.push(panel);
+      }
+    });
+    // M/dir are likewise in current closed-world coordinates and must be
+    // unwound through this hinge's own ancestor chain before storing, so
+    // that re-deriving its world position later (via computeWorldAxes-
+    // WithAngles) starts from the same convention as everything else.
+    const dir = normalize({x:-normal.y, y:normal.x});
+    const chain = ancestorChain || [];
+    const localAxisP = undoClosedChain(M, chain, axesClosed);
+    const localAxisQ = undoClosedChain({x:M.x+dir.x, y:M.y+dir.y}, chain, axesClosed);
+    const localAxisDir = normalize({x:localAxisQ.x-localAxisP.x, y:localAxisQ.y-localAxisP.y});
+    hinges.push({ axisP:localAxisP, axisDir:localAxisDir, angle:180, ancestorChain: chain });
+    panels = newPanels;
+  }
+
   function pushHistory(){
-    history.push(shape.map(p=>({x:p.x,y:p.y})));
+    history.push({ shape: shape.map(p=>({x:p.x,y:p.y})), panels: clonePanels(panels), hinges: cloneHinges(hinges) });
     if(history.length>30) history.shift();
   }
 
@@ -419,8 +535,13 @@
   function foldTo(vertexIndex, targetPoint){
     const merged = computeFold(vertexIndex, targetPoint);
     if(!merged) return;
+    const P0 = shape[vertexIndex];
+    const M = scale(add(P0,targetPoint), 0.5);
+    const normal = normalize(sub(targetPoint,P0));
     pushHistory();
     shape = merged;
+    applyFoldToPanels(M, normal);
+    render3D();
   }
 
   function flipShape(){
@@ -428,18 +549,36 @@
     const cx = (Math.min(...xs)+Math.max(...xs))/2;
     pushHistory();
     shape = fixWinding(shape.map(p=>({x: 2*cx - p.x, y: p.y})), CANON_POSITIVE);
+    panels = panels.map(p=>({
+      poly2d: p.poly2d.map(pt=>({x: 2*cx-pt.x, y: pt.y})),
+      hingeChain: p.hingeChain.slice()
+    }));
+    hinges = hinges.map(h=>({
+      axisP: {x: 2*cx-h.axisP.x, y:h.axisP.y},
+      axisDir: {x: -h.axisDir.x, y: h.axisDir.y},
+      angle: h.angle,
+      ancestorChain: h.ancestorChain.slice()
+    }));
+    render3D();
   }
 
   function undo(){
     if(history.length===0) return;
-    shape = history.pop();
+    const prev = history.pop();
+    shape = prev.shape;
+    panels = prev.panels;
+    hinges = prev.hinges;
+    render3D();
   }
 
   function reset(){
     pushHistory();
     shape = startShape();
+    panels = [{ poly2d: shape.map(p=>({x:p.x,y:p.y})), hingeChain: [] }];
+    hinges = [];
     history = [];
     updateReadout('');
+    render3D();
   }
 
   // ---------- drawing ----------
@@ -716,6 +855,216 @@
     requestAnimationFrame(frame);
   }
 
+  // ---------- 3D scene (Three.js) ----------
+  // Shows the paper as it's actually assembled — flat panels hinged along
+  // each fold line — rather than the flattened 2D silhouette above. Every
+  // hinge defaults to 180° (fully folded, exactly reproducing the 2D
+  // outline when viewed from above with the "Раскрытие" slider at 0), and
+  // the slider opens every hinge together toward a shallower angle so the
+  // model can be seen — and eventually measured — in real 3D.
+  const canvas3d = document.getElementById('scene3d');
+  const W3 = canvas3d.width, H3 = canvas3d.height;
+  const renderer3d = new THREE.WebGLRenderer({ canvas: canvas3d, antialias:true, alpha:true });
+  renderer3d.setSize(W3, H3, false);
+  renderer3d.setPixelRatio(window.devicePixelRatio||1);
+
+  const scene3d = new THREE.Scene();
+  const camera3d = new THREE.PerspectiveCamera(38, W3/H3, 1, 5000);
+
+  scene3d.add(new THREE.AmbientLight(0xffffff, 0.6));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 0.85);
+  keyLight.position.set(220, 420, 320);
+  scene3d.add(keyLight);
+
+  const planeGroup = new THREE.Group();
+  scene3d.add(planeGroup);
+
+  const paperMaterial = new THREE.MeshStandardMaterial({ color:0xf6f3ea, side:THREE.DoubleSide, roughness:0.92, metalness:0.0 });
+  const edgeMaterial = new THREE.LineBasicMaterial({ color:0x6b6558 });
+  let panelMeshes = [];
+
+  // manual mouse-drag orbit (kept dependency-free, no OrbitControls addon)
+  let camYaw = 0.6, camPitch = 0.35, camDist = 480;
+  function updateCamera3d(){
+    const cy = Math.cos(camPitch), sy = Math.sin(camPitch);
+    const cx = Math.cos(camYaw), sx = Math.sin(camYaw);
+    camera3d.position.set(camDist*cy*sx, camDist*sy, camDist*cy*cx);
+    camera3d.lookAt(0,0,0);
+  }
+  updateCamera3d();
+
+  let dragging3d=false, last3dX=0, last3dY=0;
+  canvas3d.addEventListener('mousedown', e=>{ dragging3d=true; last3dX=e.clientX; last3dY=e.clientY; });
+  window.addEventListener('mousemove', e=>{
+    if(!dragging3d) return;
+    const dx=e.clientX-last3dX, dy=e.clientY-last3dY;
+    last3dX=e.clientX; last3dY=e.clientY;
+    camYaw -= dx*0.008;
+    camPitch = Math.max(-1.3, Math.min(1.3, camPitch + dy*0.008));
+    updateCamera3d();
+    renderer3d.render(scene3d, camera3d);
+  });
+  window.addEventListener('mouseup', ()=>{ dragging3d=false; });
+
+  function rotatePointAroundAxis(p, axisPoint, axisDir, angleDeg){
+    const theta = angleDeg*Math.PI/180;
+    const rel = {x:p.x-axisPoint.x, y:p.y-axisPoint.y, z:p.z-axisPoint.z};
+    const k = axisDir;
+    const kdotrel = k.x*rel.x + k.y*rel.y + k.z*rel.z;
+    const kxrel = { x:k.y*rel.z-k.z*rel.y, y:k.z*rel.x-k.x*rel.z, z:k.x*rel.y-k.y*rel.x };
+    const cosT=Math.cos(theta), sinT=Math.sin(theta);
+    return {
+      x: axisPoint.x + rel.x*cosT + kxrel.x*sinT + k.x*kdotrel*(1-cosT),
+      y: axisPoint.y + rel.y*cosT + kxrel.y*sinT + k.y*kdotrel*(1-cosT),
+      z: axisPoint.z + rel.z*cosT + kxrel.z*sinT + k.z*kdotrel*(1-cosT),
+    };
+  }
+  function normalize3(v){ const l=Math.hypot(v.x,v.y,v.z)||1; return {x:v.x/l,y:v.y/l,z:v.z/l}; }
+
+  // Compute every hinge's own WORLD axis under a chosen angle policy
+  // (`getAngle(hingeIndex) -> degrees`), so the same machinery can answer
+  // both "where is everything with all hinges closed" (used to keep
+  // folding itself self-consistent) and "where is everything at the
+  // slider's current spread" (used for display). Each hinge's axis is
+  // itself carried along by whatever hinges came before it in its
+  // ancestorChain; processing hinges in creation order means every
+  // ancestor's world axis is already known by the time it's needed.
+  function computeWorldAxesWithAngles(getAngle){
+    const axesByHinge = [];
+    hinges.forEach((h, idx)=>{
+      let p3 = {x:h.axisP.x, y:h.axisP.y, z:0};
+      let q3 = {x:h.axisP.x+h.axisDir.x, y:h.axisP.y+h.axisDir.y, z:0};
+      h.ancestorChain.forEach(ai=>{
+        const a = axesByHinge[ai];
+        const ang = getAngle(ai);
+        p3 = rotatePointAroundAxis(p3, a.worldAxisP, a.worldAxisDir, ang);
+        q3 = rotatePointAroundAxis(q3, a.worldAxisP, a.worldAxisDir, ang);
+      });
+      axesByHinge[idx] = { worldAxisP:p3, worldAxisDir: normalize3({x:q3.x-p3.x, y:q3.y-p3.y, z:q3.z-p3.z}) };
+    });
+    return axesByHinge;
+  }
+
+  // Walk a 2D point that lives at hinge-angle-0 (in the LAST hinge of
+  // `chain`'s local frame) through that chain to its 3D position, using
+  // pre-computed world axes and the same angle policy they were built with.
+  function pointFromChainWithAxes(raw2d, chain, axesByHinge, getAngle){
+    let p3 = {x:raw2d.x, y:raw2d.y, z:0};
+    for(const hi of chain){
+      const a = axesByHinge[hi];
+      p3 = rotatePointAroundAxis(p3, a.worldAxisP, a.worldAxisDir, getAngle(hi));
+    }
+    return p3;
+  }
+
+  // Undo a chain of all-closed (180°) hinge rotations to recover a point's
+  // local coordinates relative to the panel's own last hinge. A 180°
+  // rotation is its own inverse, so "undo" is just re-applying the same
+  // rotations in reverse order.
+  function undoClosedChain(worldPt2D, chain, axesClosed){
+    let p3 = {x:worldPt2D.x, y:worldPt2D.y, z:0};
+    for(let i=chain.length-1;i>=0;i--){
+      const a = axesClosed[chain[i]];
+      p3 = rotatePointAroundAxis(p3, a.worldAxisP, a.worldAxisDir, 180);
+    }
+    return {x:p3.x, y:p3.y};
+  }
+
+  function pointInTriangle(p,a,b,c){
+    const d1 = (p.x-b.x)*(a.y-b.y)-(a.x-b.x)*(p.y-b.y);
+    const d2 = (p.x-c.x)*(b.y-c.y)-(b.x-c.x)*(p.y-c.y);
+    const d3 = (p.x-a.x)*(c.y-a.y)-(c.x-a.x)*(p.y-a.y);
+    const hasNeg = (d1<0)||(d2<0)||(d3<0), hasPos = (d1>0)||(d2>0)||(d3>0);
+    return !(hasNeg&&hasPos);
+  }
+
+  // Ear-clipping triangulation in the panel's own flat 2D coordinates —
+  // needed because panels can be concave, where a naive vertex fan would
+  // produce inverted/overlapping triangles.
+  function triangulatePolygon2D(poly){
+    let signedA = 0;
+    for(let i=0;i<poly.length;i++){ const p=poly[i], q=poly[(i+1)%poly.length]; signedA += p.x*q.y - q.x*p.y; }
+    const remaining = signedA<0 ? poly.map((_,i)=>i).reverse() : poly.map((_,i)=>i);
+    const tris = [];
+    let guard = 0;
+    while(remaining.length>3 && guard++<2000){
+      let earFound=false;
+      for(let i=0;i<remaining.length;i++){
+        const iPrev = remaining[(i-1+remaining.length)%remaining.length];
+        const iCur = remaining[i];
+        const iNext = remaining[(i+1)%remaining.length];
+        const a=poly[iPrev], b=poly[iCur], c=poly[iNext];
+        const cross = (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+        if(cross <= 1e-9) continue; // reflex or degenerate corner, not an ear
+        const isEar = remaining.every(j => j===iPrev||j===iCur||j===iNext || !pointInTriangle(poly[j],a,b,c));
+        if(isEar){ tris.push([iPrev,iCur,iNext]); remaining.splice(i,1); earFound=true; break; }
+      }
+      if(!earFound) break; // degenerate input — stop rather than loop forever
+    }
+    if(remaining.length===3) tris.push([remaining[0],remaining[1],remaining[2]]);
+    return tris;
+  }
+
+  function render3D(){
+    if(typeof THREE==='undefined') return;
+    const getAngle = i => hinges[i].angle;
+    const axes = computeWorldAxesWithAngles(getAngle);
+
+    panelMeshes.forEach(m=>{ planeGroup.remove(m.mesh); planeGroup.remove(m.edges); });
+    panelMeshes = [];
+
+    const allWorldPts = [];
+    panels.forEach(panel=> panel.poly2d.forEach(pt=> allWorldPts.push(pointFromChainWithAxes(pt, panel.hingeChain, axes, getAngle))));
+    if(allWorldPts.length===0){ renderer3d.render(scene3d,camera3d); return; }
+    const cx = allWorldPts.reduce((s,p)=>s+p.x,0)/allWorldPts.length;
+    const cy = allWorldPts.reduce((s,p)=>s+p.y,0)/allWorldPts.length;
+    const cz = allWorldPts.reduce((s,p)=>s+p.z,0)/allWorldPts.length;
+
+    panels.forEach(panel=>{
+      if(panel.poly2d.length<3) return;
+      // canvas y grows downward; three.js y grows upward, so flip it here
+      const worldPts = panel.poly2d.map(pt=>{
+        const w = pointFromChainWithAxes(pt, panel.hingeChain, axes, getAngle);
+        return { x:w.x-cx, y:-(w.y-cy), z:w.z-cz };
+      });
+
+      const tris = triangulatePolygon2D(panel.poly2d);
+      const positions = [];
+      tris.forEach(([a,b,c])=>{
+        positions.push(worldPts[a].x,worldPts[a].y,worldPts[a].z);
+        positions.push(worldPts[b].x,worldPts[b].y,worldPts[b].z);
+        positions.push(worldPts[c].x,worldPts[c].y,worldPts[c].z);
+      });
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+      geom.computeVertexNormals();
+      const mesh = new THREE.Mesh(geom, paperMaterial);
+      planeGroup.add(mesh);
+
+      const edgePos = [];
+      worldPts.concat([worldPts[0]]).forEach(p=> edgePos.push(p.x,p.y,p.z));
+      const edgeGeom = new THREE.BufferGeometry();
+      edgeGeom.setAttribute('position', new THREE.Float32BufferAttribute(edgePos,3));
+      const edges = new THREE.Line(edgeGeom, edgeMaterial);
+      planeGroup.add(edges);
+
+      panelMeshes.push({mesh, edges});
+    });
+
+    renderer3d.render(scene3d, camera3d);
+  }
+
+  const spreadSlider = document.getElementById('spreadSlider');
+  const spreadValueLabel = document.getElementById('spreadValue');
+  const HINGE_CLOSED_ANGLE = 180, HINGE_OPEN_ANGLE = 90;
+  spreadSlider.addEventListener('input', ()=>{
+    const t = spreadSlider.value/100;
+    const angle = HINGE_CLOSED_ANGLE + (HINGE_OPEN_ANGLE-HINGE_CLOSED_ANGLE)*t;
+    hinges.forEach(h=> h.angle = angle);
+    spreadValueLabel.textContent = Math.round(t*100)+'%';
+    render3D();
+  });
+
   // ---------- wire up UI ----------
   document.getElementById('undoBtn').addEventListener('click', ()=>{ undo(); draw(); });
   document.getElementById('flipBtn').addEventListener('click', ()=>{ flipShape(); draw(); });
@@ -723,6 +1072,7 @@
   document.getElementById('testBtn').addEventListener('click', runSlopeTest);
 
   draw();
+  render3D();
 })();
 </script>
 </body>
