@@ -1,0 +1,664 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Сложи самолётик</title>
+<style>
+  :root{
+    --paper:#f6f3ea;
+    --paper-shadow:#d8d2bf;
+    --ink:#2b2a28;
+    --accent:#3f6b5c;
+    --accent-soft:#e4ece8;
+    --line:#c9c2ae;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    min-height:100vh;
+    background:#efece2;
+    font-family: Georgia, 'Times New Roman', serif;
+    color:var(--ink);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    padding:28px 16px 40px;
+  }
+  h1{
+    font-size:1.4rem;
+    font-weight:600;
+    letter-spacing:.02em;
+    margin:0 0 4px;
+  }
+  p.sub{
+    margin:0 0 20px;
+    font-size:.92rem;
+    color:#6b6558;
+    max-width:480px;
+    text-align:center;
+    line-height:1.4;
+  }
+  .stage{
+    position:relative;
+    background:#fff;
+    border:1px solid var(--line);
+    box-shadow:0 8px 24px rgba(0,0,0,.06);
+  }
+  canvas{display:block;}
+  .controls{
+    display:flex;
+    gap:10px;
+    margin-top:16px;
+    flex-wrap:wrap;
+    justify-content:center;
+  }
+  button{
+    font-family:inherit;
+    font-size:.85rem;
+    padding:9px 16px;
+    border:1px solid var(--ink);
+    background:transparent;
+    color:var(--ink);
+    cursor:pointer;
+    border-radius:3px;
+    transition:background .15s, color .15s;
+  }
+  button:hover{background:var(--ink); color:#fff;}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
+  button.primary:hover{background:#345a4d;}
+  button:disabled{opacity:.35; cursor:default;}
+  button:disabled:hover{background:transparent; color:var(--ink);}
+  .readout{
+    margin-top:18px;
+    font-size:.85rem;
+    color:#4a463c;
+    min-height:1.2em;
+    text-align:center;
+  }
+  .hint{
+    font-size:.78rem;
+    color:#96907e;
+    margin-top:4px;
+  }
+</style>
+</head>
+<body>
+
+  <h1>Сложи самолётик</h1>
+  <p class="sub">Тяни уголки листа мышкой, чтобы сгибать бумагу. Собери самолётик и запусти тест на склоне — посмотрим, далеко ли он улетит.</p>
+
+  <div class="stage">
+    <canvas id="foldCanvas" width="480" height="480"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="undoBtn">Отменить сгиб</button>
+    <button id="flipBtn">Перевернуть лист</button>
+    <button id="resetBtn">Начать заново</button>
+    <button id="testBtn" class="primary">Тест на склоне</button>
+  </div>
+
+  <div class="readout" id="readout"></div>
+  <div class="hint">Захватывай именно уголки листа — маленькие точки на контуре.</div>
+
+<script>
+(function(){
+  "use strict";
+
+  const canvas = document.getElementById('foldCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // ---------- geometry helpers ----------
+  function sub(a,b){return {x:a.x-b.x, y:a.y-b.y};}
+  function add(a,b){return {x:a.x+b.x, y:a.y+b.y};}
+  function scale(a,s){return {x:a.x*s, y:a.y*s};}
+  function dot(a,b){return a.x*b.x + a.y*b.y;}
+  function len(a){return Math.hypot(a.x,a.y);}
+  function normalize(a){const l=len(a)||1; return {x:a.x/l, y:a.y/l};}
+
+  function polygonArea(pts){
+    let s=0;
+    for(let i=0;i<pts.length;i++){
+      const p=pts[i], q=pts[(i+1)%pts.length];
+      s += p.x*q.y - q.x*p.y;
+    }
+    return Math.abs(s)/2;
+  }
+
+  function convexHull(points){
+    const pts = points.slice().sort((a,b)=> a.x-b.x || a.y-b.y);
+    if(pts.length<3) return pts;
+    const cross=(o,a,b)=> (a.x-o.x)*(b.y-o.y) - (a.y-o.y)*(b.x-o.x);
+    const lower=[];
+    for(const p of pts){
+      while(lower.length>=2 && cross(lower[lower.length-2],lower[lower.length-1],p)<=0) lower.pop();
+      lower.push(p);
+    }
+    const upper=[];
+    for(let i=pts.length-1;i>=0;i--){
+      const p=pts[i];
+      while(upper.length>=2 && cross(upper[upper.length-2],upper[upper.length-1],p)<=0) upper.pop();
+      upper.push(p);
+    }
+    lower.pop(); upper.pop();
+    return lower.concat(upper);
+  }
+
+  // Sutherland-Hodgman clip: keep points where dot(p-linePoint,normal) has given sign
+  function clipHalfPlane(pts, linePoint, normal, keepPositive){
+    const out=[];
+    const side = p => {
+      const d = dot(sub(p,linePoint), normal);
+      return keepPositive ? d>=0 : d<=0;
+    };
+    const intersect = (a,b) => {
+      const da = dot(sub(a,linePoint), normal);
+      const db = dot(sub(b,linePoint), normal);
+      const t = da/(da-db);
+      return add(a, scale(sub(b,a), t));
+    };
+    for(let i=0;i<pts.length;i++){
+      const cur = pts[i], prev = pts[(i-1+pts.length)%pts.length];
+      const curIn = side(cur), prevIn = side(prev);
+      if(curIn){
+        if(!prevIn) out.push(intersect(prev,cur));
+        out.push(cur);
+      } else if(prevIn){
+        out.push(intersect(prev,cur));
+      }
+    }
+    return out;
+  }
+
+  // ---------- state ----------
+  const START_W = 220, START_H = 320;
+  const cx0 = W/2, cy0 = H/2;
+  function startShape(){
+    return [
+      {x:cx0-START_W/2, y:cy0-START_H/2},
+      {x:cx0+START_W/2, y:cy0-START_H/2},
+      {x:cx0+START_W/2, y:cy0+START_H/2},
+      {x:cx0-START_W/2, y:cy0+START_H/2},
+    ];
+  }
+
+  let shape = startShape();
+  const CANON_POSITIVE = polygonSignedArea(shape) > 0;
+  let history = [];
+  let dragIndex = -1;
+  let dragTarget = null;
+
+  function pushHistory(){
+    history.push(shape.map(p=>({x:p.x,y:p.y})));
+    if(history.length>30) history.shift();
+  }
+
+  // ---------- fold operation ----------
+  // A real paper fold does NOT collapse to the convex hull of the two
+  // pieces: the folded flap can leave a concave notch or step where it
+  // doesn't line up with the base outline (that's exactly what makes a
+  // paper airplane look like a paper airplane). So instead of hulling the
+  // union, we glue the base and the reflected flap together along their
+  // shared fold-line edge and trace the real (possibly concave) outline.
+
+  function polygonSignedArea(pts){
+    let s=0;
+    for(let i=0;i<pts.length;i++){
+      const p=pts[i], q=pts[(i+1)%pts.length];
+      s += p.x*q.y - q.x*p.y;
+    }
+    return s/2;
+  }
+
+  function fixWinding(pts, wantPositive){
+    const a = polygonSignedArea(pts);
+    return ((wantPositive && a<0) || (!wantPositive && a>0)) ? pts.slice().reverse() : pts.slice();
+  }
+
+  function pointsClose(a,b,eps){ return Math.abs(a.x-b.x)<eps && Math.abs(a.y-b.y)<eps; }
+
+  function findCommonPoints(a, b, eps){
+    eps = eps||0.5;
+    const out=[];
+    a.forEach(p=>{
+      if(b.some(q=>pointsClose(p,q,eps)) && !out.some(o=>pointsClose(o,p,eps))) out.push(p);
+    });
+    return out;
+  }
+
+  function cleanupPolygon(pts, eps){
+    eps = eps||0.5;
+    let out = [];
+    for(let i=0;i<pts.length;i++){
+      const p = pts[i];
+      if(out.length===0 || !pointsClose(out[out.length-1], p, eps)) out.push(p);
+    }
+    if(out.length>1 && pointsClose(out[0], out[out.length-1], eps)) out.pop();
+    let changed = true;
+    while(changed && out.length>3){
+      changed = false;
+      for(let i=0;i<out.length;i++){
+        const a = out[(i-1+out.length)%out.length], b = out[i], c = out[(i+1)%out.length];
+        const cross = (b.x-a.x)*(c.y-a.y) - (b.y-a.y)*(c.x-a.x);
+        const scaleRef = Math.max(len(sub(b,a)), len(sub(c,b)), 1);
+        if(Math.abs(cross) < eps*scaleRef){ out.splice(i,1); changed = true; break; }
+      }
+    }
+    return out;
+  }
+
+  function segCross(o,a,b){ return (a.x-o.x)*(b.y-o.y) - (a.y-o.y)*(b.x-o.x); }
+  function segmentsProperlyIntersect(p1,p2,p3,p4){
+    const d1 = segCross(p3,p4,p1), d2 = segCross(p3,p4,p2);
+    const d3 = segCross(p1,p2,p3), d4 = segCross(p1,p2,p4);
+    return ((d1>0&&d2<0)||(d1<0&&d2>0)) && ((d3>0&&d4<0)||(d3<0&&d4>0));
+  }
+
+  function isSimplePolygon(pts){
+    const n = pts.length;
+    for(let i=0;i<n;i++){
+      for(let j=i+1;j<n;j++){
+        const nextI=(i+1)%n, nextJ=(j+1)%n;
+        if(j===i || j===nextI || nextJ===i) continue;
+        if(segmentsProperlyIntersect(pts[i],pts[nextI],pts[j],pts[nextJ])) return false;
+      }
+    }
+    return true;
+  }
+
+  function pointInPolygon(pt, poly){
+    let inside = false;
+    for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+      const xi=poly[i].x, yi=poly[i].y, xj=poly[j].x, yj=poly[j].y;
+      const hit = ((yi>pt.y)!==(yj>pt.y)) && (pt.x < (xj-xi)*(pt.y-yi)/((yj-yi)||1e-9)+xi);
+      if(hit) inside = !inside;
+    }
+    return inside;
+  }
+
+  function distToSegment(p,a,b){
+    const ab = sub(b,a);
+    const t = Math.max(0, Math.min(1, dot(sub(p,a),ab)/(dot(ab,ab)||1)));
+    return len(sub(p, add(a, scale(ab,t))));
+  }
+
+  function allVerticesWithin(poly, container, eps){
+    eps = eps||1.5;
+    return poly.every(p=>{
+      if(pointInPolygon(p, container)) return true;
+      return container.some((a,i)=> distToSegment(p, a, container[(i+1)%container.length]) < eps);
+    });
+  }
+
+  // General polygon union (Weiler-Atherton style), specialised for our two
+  // inputs: `base` (the part of the paper that stays put) and `flap` (the
+  // reflected part), which always share the fold line as a coincident edge
+  // through h1/h2. Real overlap between flap and base — the flap tucking
+  // partway under/over the base — is common and must be resolved properly,
+  // not hulled away, or the notches/steps that make the silhouette
+  // recognisable as a folded shape get erased.
+  function segIntersectParam(p1,p2,p3,p4){
+    const r = sub(p2,p1), s = sub(p4,p3);
+    const denom = r.x*s.y - r.y*s.x;
+    if(Math.abs(denom) < 1e-9) return null;
+    const qp = sub(p3,p1);
+    const t = (qp.x*s.y - qp.y*s.x)/denom;
+    const u = (qp.x*r.y - qp.y*r.x)/denom;
+    const eps = 1e-6;
+    if(t<eps || t>1-eps || u<eps || u>1-eps) return null;
+    return { t, pt: add(p1, scale(r,t)) };
+  }
+
+  function unionKey(p){ return Math.round(p.x*20)+','+Math.round(p.y*20); }
+
+  // Walk polygon P's edges, splicing in every point where it crosses Q, plus
+  // any of `switchPoints` (the shared hinge vertices) so the walk can hop
+  // between P and Q there even when they don't otherwise cross.
+  function buildAugmented(P, Q, switchPoints){
+    const augmented = [];
+    for(let i=0;i<P.length;i++){
+      const a = P[i], b = P[(i+1)%P.length];
+      augmented.push({ pt:a, cross: switchPoints.some(sp=>pointsClose(sp,a,0.75)) });
+      const hits = [];
+      for(let j=0;j<Q.length;j++){
+        const res = segIntersectParam(a,b, Q[j], Q[(j+1)%Q.length]);
+        if(res) hits.push(res);
+      }
+      hits.sort((h1,h2)=>h1.t-h2.t);
+      hits.forEach(h=> augmented.push({ pt:h.pt, cross:true }));
+    }
+    return augmented;
+  }
+
+  function unionAlongHinge(partB, flapRaw, h1, h2){
+    const base = fixWinding(partB, CANON_POSITIVE);
+    const flap = fixWinding(flapRaw, CANON_POSITIVE);
+    if(allVerticesWithin(flap, base)) return base;
+    if(allVerticesWithin(base, flap)) return flap;
+
+    const switchPoints = [h1,h2];
+    const augBase = buildAugmented(base, flap, switchPoints);
+    const augFlap = buildAugmented(flap, base, switchPoints);
+
+    const flapIndexByKey = new Map();
+    augFlap.forEach((v,idx)=>{ if(v.cross && !flapIndexByKey.has(unionKey(v.pt))) flapIndexByKey.set(unionKey(v.pt), idx); });
+    const baseIndexByKey = new Map();
+    augBase.forEach((v,idx)=>{ if(v.cross && !baseIndexByKey.has(unionKey(v.pt))) baseIndexByKey.set(unionKey(v.pt), idx); });
+
+    let startIdx = -1;
+    for(let i=0;i<augBase.length;i++){
+      if(!augBase[i].cross && !pointInPolygon(augBase[i].pt, flap)){ startIdx = i; break; }
+    }
+    if(startIdx<0) return null; // base fully covered by flap in a way we couldn't shortcut above
+
+    let onBase = true, idx = startIdx;
+    const result = [];
+    const maxSteps = (augBase.length+augFlap.length)*3 + 30;
+    for(let steps=0; ; steps++){
+      const cur = onBase ? augBase : augFlap;
+      const v = cur[idx];
+      result.push(v.pt);
+
+      if(v.cross){
+        const nextV = cur[(idx+1)%cur.length];
+        const mid = scale(add(v.pt,nextV.pt), 0.5);
+        const other = onBase ? flap : base;
+        if(pointInPolygon(mid, other)){
+          const key = unionKey(v.pt);
+          const j = onBase ? flapIndexByKey.get(key) : baseIndexByKey.get(key);
+          if(j===undefined) return null;
+          onBase = !onBase;
+          idx = j;
+        }
+      }
+
+      idx = (idx+1) % (onBase ? augBase.length : augFlap.length);
+      if(onBase && idx===startIdx) break;
+      if(steps>maxSteps) return null;
+    }
+    return result;
+  }
+
+  function computeFold(vertexIndex, targetPoint){
+    const P0 = shape[vertexIndex];
+    const P1 = targetPoint;
+    if(len(sub(P1,P0)) < 6) return null; // too small a fold, ignore
+
+    const M = scale(add(P0,P1), 0.5);
+    const normal = normalize(sub(P1,P0)); // P0 side = negative, P1 side = positive
+
+    const partA = clipHalfPlane(shape, M, normal, false); // P0 side (folds over)
+    const partB = clipHalfPlane(shape, M, normal, true);  // stays
+
+    if(partA.length<3 || partB.length<3) return null; // degenerate fold, ignore
+
+    const reflectedA = partA.map(p=>{
+      const d = dot(sub(p,M), normal);
+      return sub(p, scale(normal, 2*d));
+    });
+
+    let merged = null;
+    const hinge = findCommonPoints(partA, partB);
+    if(hinge.length===2){
+      merged = unionAlongHinge(partB, reflectedA, hinge[0], hinge[1]);
+      if(merged) merged = cleanupPolygon(merged);
+      if(!merged || merged.length<3 || polygonArea(merged)<1 || !isSimplePolygon(merged)){
+        merged = null;
+      }
+    }
+
+    // Last-resort fallback for cuts we can't cleanly trace (e.g. a line
+    // crossing an already-concave outline more than twice) — better a
+    // slightly-too-convex shape than a broken/self-crossing one.
+    if(!merged) merged = convexHull(partB.concat(reflectedA));
+
+    return merged.length>=3 ? merged : null;
+  }
+
+  function foldTo(vertexIndex, targetPoint){
+    const merged = computeFold(vertexIndex, targetPoint);
+    if(!merged) return;
+    pushHistory();
+    shape = merged;
+  }
+
+  function flipShape(){
+    const xs = shape.map(p=>p.x);
+    const cx = (Math.min(...xs)+Math.max(...xs))/2;
+    pushHistory();
+    shape = fixWinding(shape.map(p=>({x: 2*cx - p.x, y: p.y})), CANON_POSITIVE);
+  }
+
+  function undo(){
+    if(history.length===0) return;
+    shape = history.pop();
+  }
+
+  function reset(){
+    pushHistory();
+    shape = startShape();
+    history = [];
+    updateReadout('');
+  }
+
+  // ---------- drawing ----------
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+
+    // subtle grid backdrop
+    ctx.strokeStyle = '#f0ede3';
+    ctx.lineWidth = 1;
+    for(let x=0;x<W;x+=24){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for(let y=0;y<H;y+=24){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+    drawPolygon(shape, '#f6f3ea', '#8a8370', 2);
+
+    // draggable vertex handles
+    shape.forEach((p,i)=>{
+      ctx.beginPath();
+      ctx.arc(p.x,p.y, i===dragIndex?7:5, 0, Math.PI*2);
+      ctx.fillStyle = i===dragIndex ? '#3f6b5c' : '#4a463c';
+      ctx.fill();
+    });
+
+    // drag preview
+    if(dragIndex>=0 && dragTarget){
+      const P0 = shape[dragIndex];
+      ctx.setLineDash([5,4]);
+      ctx.strokeStyle = '#3f6b5c';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(P0.x,P0.y);
+      ctx.lineTo(dragTarget.x,dragTarget.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // preview of resulting shape
+      const P1 = dragTarget;
+      if(len(sub(P1,P0))>=6){
+        const merged = computeFold(dragIndex, P1);
+        if(merged) drawPolygon(merged, 'rgba(63,107,92,0.18)', 'rgba(63,107,92,0.6)', 1.5, true);
+      }
+    }
+  }
+
+  function drawPolygon(pts, fill, stroke, width, dashed){
+    ctx.beginPath();
+    pts.forEach((p,i)=> i===0 ? ctx.moveTo(p.x,p.y) : ctx.lineTo(p.x,p.y));
+    ctx.closePath();
+    if(dashed){ ctx.setLineDash([4,3]); }
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = width;
+    ctx.stroke();
+    if(dashed){ ctx.setLineDash([]); }
+  }
+
+  // ---------- mouse interaction ----------
+  function mousePos(evt){
+    const r = canvas.getBoundingClientRect();
+    return { x: (evt.clientX-r.left) * (canvas.width/r.width),
+             y: (evt.clientY-r.top) * (canvas.height/r.height) };
+  }
+
+  canvas.addEventListener('mousedown', e=>{
+    const pos = mousePos(e);
+    let best=-1, bestD=18;
+    shape.forEach((p,i)=>{
+      const d = len(sub(p,pos));
+      if(d<bestD){ bestD=d; best=i; }
+    });
+    if(best>=0){ dragIndex=best; dragTarget=pos; }
+  });
+  canvas.addEventListener('mousemove', e=>{
+    if(dragIndex>=0){ dragTarget = mousePos(e); draw(); }
+  });
+  window.addEventListener('mouseup', e=>{
+    if(dragIndex>=0){
+      const pos = mousePos(e);
+      foldTo(dragIndex, pos);
+      dragIndex=-1; dragTarget=null;
+      draw();
+    }
+  });
+
+  // ---------- aerodynamics ----------
+  function evaluateFlight(pts){
+    const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+    const minX=Math.min(...xs), maxX=Math.max(...xs);
+    const minY=Math.min(...ys), maxY=Math.max(...ys);
+    const width = maxX-minX, height = maxY-minY;
+    const mainAxisX = width>=height;
+
+    const length = mainAxisX ? width : height;
+    const span = mainAxisX ? height : width;
+
+    // nose = extreme point along main axis (front)
+    let nose;
+    if(mainAxisX){
+      nose = pts.reduce((a,b)=> b.x<a.x ? b : a);
+    } else {
+      nose = pts.reduce((a,b)=> b.y<a.y ? b : a);
+    }
+    const idx = pts.indexOf(nose);
+    const prev = pts[(idx-1+pts.length)%pts.length];
+    const next = pts[(idx+1)%pts.length];
+    const v1 = normalize(sub(prev,nose)), v2 = normalize(sub(next,nose));
+    const angle = Math.acos(Math.max(-1,Math.min(1,dot(v1,v2)))) * 180/Math.PI;
+    const noseScore = Math.max(0, Math.min(1, 1 - angle/140));
+
+    // symmetry across the centerline perpendicular to main axis
+    const centerline = mainAxisX ? (minY+maxY)/2 : (minX+maxX)/2;
+    const linePoint = mainAxisX ? {x:0,y:centerline} : {x:centerline,y:0};
+    const normal = mainAxisX ? {x:0,y:1} : {x:1,y:0};
+    const halfA = clipHalfPlane(pts, linePoint, normal, true);
+    const halfB = clipHalfPlane(pts, linePoint, normal, false);
+    const areaA = polygonArea(halfA), areaB = polygonArea(halfB);
+    const symmetry = (areaA+areaB)>0 ? 1 - Math.abs(areaA-areaB)/(areaA+areaB) : 0;
+
+    const elongation = span>0 ? length/span : 0;
+    const elongationScore = Math.max(0, Math.min(1, 1 - Math.abs(elongation-2.6)/2.6));
+
+    const score = 0.4*symmetry + 0.3*noseScore + 0.3*elongationScore;
+    const distance = Math.round(8 + score*40);
+    const wobble = Math.round((1-symmetry)*30);
+
+    return {score, distance, wobble, symmetry, noseScore, elongationScore, mainAxisX};
+  }
+
+  function updateReadout(text){
+    document.getElementById('readout').textContent = text;
+  }
+
+  // ---------- slope test animation ----------
+  function runSlopeTest(){
+    const result = evaluateFlight(shape);
+    updateReadout('Запуск...');
+
+    ctx.clearRect(0,0,W,H);
+    const groundY = H-70;
+
+    // hill + person
+    function drawScene(planeX, planeY, planeAngle){
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle = '#eef2ea';
+      ctx.fillRect(0,0,W,H);
+
+      // slope
+      ctx.beginPath();
+      ctx.moveTo(0, groundY+40);
+      ctx.lineTo(90, groundY-30);
+      ctx.lineTo(W, groundY-30+ (W-90)*0.02);
+      ctx.lineTo(W, H);
+      ctx.lineTo(0,H);
+      ctx.closePath();
+      ctx.fillStyle = '#cfead0';
+      ctx.fill();
+
+      // person (simple stick figure) at top of the hill
+      const px=90, py=groundY-30;
+      ctx.strokeStyle = '#2b2a28';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(px, py-46, 8, 0, Math.PI*2); ctx.stroke(); // head
+      ctx.beginPath(); ctx.moveTo(px,py-38); ctx.lineTo(px,py-14); ctx.stroke(); // body
+      ctx.beginPath(); ctx.moveTo(px,py-14); ctx.lineTo(px-10,py+6); ctx.stroke(); // leg
+      ctx.beginPath(); ctx.moveTo(px,py-14); ctx.lineTo(px+10,py+6); ctx.stroke(); // leg
+      ctx.beginPath(); ctx.moveTo(px,py-30); ctx.lineTo(px+18,py-40); ctx.stroke(); // throwing arm
+
+      // plane silhouette, scaled small, following the shape
+      ctx.save();
+      ctx.translate(planeX, planeY);
+      ctx.rotate(planeAngle);
+      ctx.scale(0.35,0.35);
+      const cxp = shape.reduce((s,p)=>s+p.x,0)/shape.length;
+      const cyp = shape.reduce((s,p)=>s+p.y,0)/shape.length;
+      ctx.beginPath();
+      shape.forEach((p,i)=>{
+        const lx=p.x-cxp, ly=p.y-cyp;
+        i===0? ctx.moveTo(lx,ly): ctx.lineTo(lx,ly);
+      });
+      ctx.closePath();
+      ctx.fillStyle = '#f6f3ea';
+      ctx.strokeStyle = '#6b6558';
+      ctx.lineWidth = 2;
+      ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+
+    const startX=108, startY=groundY-70;
+    const pxDistance = 40 + result.distance*6;
+    const endX = Math.min(W-20, startX+pxDistance);
+    const duration = 1400;
+    const t0 = performance.now();
+
+    function frame(now){
+      const t = Math.min(1, (now-t0)/duration);
+      const x = startX + (endX-startX)*t;
+      const arc = Math.sin(Math.PI*t) * 90;
+      const wob = Math.sin(t*18) * result.wobble * t;
+      const y = startY - arc + wob*0.3;
+      const angle = -0.5 + t*0.9 + Math.sin(t*14)*(result.wobble/120);
+      drawScene(x,y,angle);
+      if(t<1){
+        requestAnimationFrame(frame);
+      } else {
+        updateReadout(`Дальность полёта: ${result.distance} м  •  устойчивость: ${Math.round(result.symmetry*100)}%  •  острота носа: ${Math.round(result.noseScore*100)}%`);
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- wire up UI ----------
+  document.getElementById('undoBtn').addEventListener('click', ()=>{ undo(); draw(); });
+  document.getElementById('flipBtn').addEventListener('click', ()=>{ flipShape(); draw(); });
+  document.getElementById('resetBtn').addEventListener('click', ()=>{ reset(); draw(); });
+  document.getElementById('testBtn').addEventListener('click', runSlopeTest);
+
+  draw();
+})();
+</script>
+</body>
+</html>
