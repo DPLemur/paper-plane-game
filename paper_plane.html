@@ -881,7 +881,14 @@
 
     const score = dartScore;
     const distance = Math.round(8 + dartScore*40 + glideScore*22);
-    const wobble = Math.max(0, Math.round((1-base.symmetry)*20 + (1-aero.massScore)*10 - glideScore*6));
+    // Gliding smooths the flight, but as a proportional damping on the
+    // asymmetry-driven wobble — never a flat subtraction, which could
+    // (and did) exceed a small base wobble and clamp a genuinely
+    // imperfect model down to a suspicious, unearned 0. A perfect
+    // glideScore of 1 damps wobble by at most 40%; real asymmetry always
+    // leaves some residual wobble behind.
+    const baseWobble = (1-base.symmetry)*20 + (1-aero.massScore)*10;
+    const wobble = Math.max(0, Math.round(baseWobble * (1 - glideScore*0.4)));
 
     return Object.assign({}, base, aero, {
       isGlider, flightMode: isGlider?'glider':'dart', dartScore, glideScore, score, distance, wobble
