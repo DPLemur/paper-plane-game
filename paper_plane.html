@@ -892,81 +892,115 @@
     document.getElementById('readout').textContent = text;
   }
 
-  // ---------- slope test animation ----------
+  // ---------- slope test animation (Пункт 3 дополнения) ----------
+  // Runs inside the same Three.js scene the assembled-model preview uses
+  // (Пункт 1): the person throws down the actual slope, not into a flat
+  // field, and a glider gets a float phase that can briefly gain height
+  // off the slope's updraft before settling into its glide, instead of a
+  // dart's plain ballistic hump. The model itself flies in its real,
+  // currently-spread 3D shape rather than a flattened cutout.
+  function buildTerrainMesh(groundYFn, farX){
+    const pts = [];
+    for(let x=-80; x<=farX; x+=20) pts.push({x, y: groundYFn(x)});
+    const shapePts = [{x:-80,y:220}, ...pts, {x:farX,y:-320}, {x:-80,y:-320}];
+    const shape = new THREE.Shape();
+    shape.moveTo(shapePts[0].x, shapePts[0].y);
+    shapePts.slice(1).forEach(p=> shape.lineTo(p.x,p.y));
+    const geom = new THREE.ShapeGeometry(shape);
+    const mat = new THREE.MeshBasicMaterial({ color:0xcfead0, side:THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.position.z = -30;
+    return mesh;
+  }
+
+  function buildPersonGroup(baseX, baseY){
+    const g = new THREE.Group();
+    const lineMat = new THREE.LineBasicMaterial({ color:0x2b2a28 });
+    function seg(x1,y1,x2,y2){
+      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x1,y1,0), new THREE.Vector3(x2,y2,0)]);
+      return new THREE.Line(geo, lineMat);
+    }
+    g.add(seg(0,38,0,14));      // body
+    g.add(seg(0,14,-10,-6));    // leg
+    g.add(seg(0,14,10,-6));     // leg
+    g.add(seg(0,30,20,42));     // throwing arm, reaching forward/down-slope
+    const head = new THREE.Mesh(new THREE.SphereGeometry(8,10,10), new THREE.MeshBasicMaterial({ color:0x2b2a28, wireframe:true }));
+    head.position.set(0,46,0);
+    g.add(head);
+    g.position.set(baseX, baseY, 0);
+    return g;
+  }
+
   function runSlopeTest(){
+    if(typeof THREE==='undefined') return;
     const result = evaluateFlight3D(shape);
     updateReadout('Запуск...');
 
-    ctx.clearRect(0,0,W,H);
-    const groundY = H-70;
+    const HILL_DROP = 150, HILL_LENGTH = 190;
+    function groundY(x){ return x<=HILL_LENGTH ? -x*(HILL_DROP/HILL_LENGTH) : -HILL_DROP; }
 
-    // hill + person
-    function drawScene(planeX, planeY, planeAngle){
-      ctx.clearRect(0,0,W,H);
-      ctx.fillStyle = '#eef2ea';
-      ctx.fillRect(0,0,W,H);
+    const totalFlightX = 220 + result.distance*7;
+    const personX = -10;
+    const launchX = personX + 45, launchHeight = 42;
 
-      // slope
-      ctx.beginPath();
-      ctx.moveTo(0, groundY+40);
-      ctx.lineTo(90, groundY-30);
-      ctx.lineTo(W, groundY-30+ (W-90)*0.02);
-      ctx.lineTo(W, H);
-      ctx.lineTo(0,H);
-      ctx.closePath();
-      ctx.fillStyle = '#cfead0';
-      ctx.fill();
+    planeGroup.visible = false;
+    const flight = buildAssembledMeshGroup(i=>hinges[i].angle);
+    const terrain = buildTerrainMesh(groundY, totalFlightX + 60);
+    const person = buildPersonGroup(personX, groundY(personX));
+    scene3d.add(flight.group);
+    scene3d.add(terrain);
+    scene3d.add(person);
 
-      // person (simple stick figure) at top of the hill
-      const px=90, py=groundY-30;
-      ctx.strokeStyle = '#2b2a28';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.arc(px, py-46, 8, 0, Math.PI*2); ctx.stroke(); // head
-      ctx.beginPath(); ctx.moveTo(px,py-38); ctx.lineTo(px,py-14); ctx.stroke(); // body
-      ctx.beginPath(); ctx.moveTo(px,py-14); ctx.lineTo(px-10,py+6); ctx.stroke(); // leg
-      ctx.beginPath(); ctx.moveTo(px,py-14); ctx.lineTo(px+10,py+6); ctx.stroke(); // leg
-      ctx.beginPath(); ctx.moveTo(px,py-30); ctx.lineTo(px+18,py-40); ctx.stroke(); // throwing arm
+    const savedCamPos = camera3d.position.clone();
+    camera3d.position.set(totalFlightX*0.42, 40, 480);
+    camera3d.lookAt(totalFlightX*0.42, -60, 0);
 
-      // plane silhouette, scaled small, following the shape
-      ctx.save();
-      ctx.translate(planeX, planeY);
-      ctx.rotate(planeAngle);
-      ctx.scale(0.35,0.35);
-      const planeCentroid = polygonCentroid(shape);
-      const cxp = planeCentroid.x, cyp = planeCentroid.y;
-      ctx.beginPath();
-      shape.forEach((p,i)=>{
-        const lx=p.x-cxp, ly=p.y-cyp;
-        i===0? ctx.moveTo(lx,ly): ctx.lineTo(lx,ly);
-      });
-      ctx.closePath();
-      ctx.fillStyle = '#f6f3ea';
-      ctx.strokeStyle = '#6b6558';
-      ctx.lineWidth = 2;
-      ctx.fill(); ctx.stroke();
-      ctx.restore();
+    function xAt(t){ return launchX + (totalFlightX-launchX)*t; }
+    // height ABOVE the (already descending) slope profile: a dart is a
+    // plain ballistic hump that returns to the ground by t=1; a glider
+    // rises fast, rides the slope's updraft for an extended float, then
+    // eases down into its final glide.
+    function floatAt(t){
+      if(!result.isGlider) return Math.sin(Math.PI*t) * 55;
+      const rise = Math.min(1, t/0.18);
+      const fallStart = 0.6;
+      const fall = t<=fallStart ? 0 : (t-fallStart)/(1-fallStart);
+      return rise * (1 - Math.pow(Math.min(1,fall), 1.6)) * 100;
+    }
+    function wobbleAt(t){ return Math.sin(t*16) * result.wobble * t * 0.6; }
+    // launchHeight fades out over the flight so the model actually settles
+    // onto the ground profile by t=1 instead of hovering at hand-height forever.
+    function yAt(t){ return groundY(xAt(t)) + launchHeight*(1-t) + floatAt(t) + wobbleAt(t); }
+    function angleAt(t){
+      const dt = 0.02, t1=Math.max(0,t-dt), t2=Math.min(1,t+dt);
+      return Math.atan2(yAt(t2)-yAt(t1), xAt(t2)-xAt(t1));
     }
 
-    const startX=108, startY=groundY-70;
-    const pxDistance = 40 + result.distance*6;
-    const endX = Math.min(W-20, startX+pxDistance);
-    const duration = 1400;
+    const duration = result.isGlider ? 2200 : 1500;
     const t0 = performance.now();
+
+    function cleanupAndRestore(){
+      disposeGroupDeep(flight.group);
+      terrain.geometry.dispose();
+      scene3d.remove(terrain);
+      disposeGroupDeep(person);
+      camera3d.position.copy(savedCamPos);
+      updateCamera3d();
+      planeGroup.visible = true;
+      render3D();
+    }
 
     function frame(now){
       const t = Math.min(1, (now-t0)/duration);
-      const x = startX + (endX-startX)*t;
-      const arc = Math.sin(Math.PI*t) * 90;
-      const wob = Math.sin(t*18) * result.wobble * t;
-      const y = startY - arc + wob*0.3;
-      const angle = -0.5 + t*0.9 + Math.sin(t*14)*(result.wobble/120);
-      drawScene(x,y,angle);
+      flight.group.position.set(xAt(t), yAt(t), 0);
+      flight.group.rotation.z = angleAt(t) - 0.25;
+      renderer3d.render(scene3d, camera3d);
       if(t<1){
         requestAnimationFrame(frame);
       } else {
         const modeLabel = result.isGlider ? 'планер' : 'дротик';
         updateReadout(`Дальность полёта: ${result.distance} м  •  режим: ${modeLabel}  •  симметрия: ${Math.round(result.symmetry*100)}%  •  V-образность: ${Math.round(result.dihedralDeg)}°  •  удлинение крыла: ${result.aspectRatio.toFixed(2)}  •  нагрузка на крыло: ${Number.isFinite(result.wingLoading) ? result.wingLoading.toFixed(2) : '—'}`);
+        cleanupAndRestore();
       }
     }
     requestAnimationFrame(frame);
@@ -1122,17 +1156,20 @@
     return tris;
   }
 
-  function render3D(){
-    if(typeof THREE==='undefined') return;
-    const getAngle = i => hinges[i].angle;
+  // Build a fresh, self-contained Three.js group holding every panel as a
+  // triangulated mesh + wire outline, at whatever hinge angles `getAngle`
+  // reports, centered on the model's own bounding centroid. Used both for
+  // the persistent "assembled model" preview and for the slope-test's
+  // flying plane, which needs its own independent group it can translate
+  // and rotate along a flight path without disturbing the preview.
+  function buildAssembledMeshGroup(getAngle){
     const axes = computeWorldAxesWithAngles(getAngle);
-
-    panelMeshes.forEach(m=>{ planeGroup.remove(m.mesh); planeGroup.remove(m.edges); });
-    panelMeshes = [];
+    const group = new THREE.Group();
+    const meshes = [];
 
     const allWorldPts = [];
     panels.forEach(panel=> panel.poly2d.forEach(pt=> allWorldPts.push(pointFromChainWithAxes(pt, panel.hingeChain, axes, getAngle))));
-    if(allWorldPts.length===0){ renderer3d.render(scene3d,camera3d); return; }
+    if(allWorldPts.length===0) return { group, meshes };
     const cx = allWorldPts.reduce((s,p)=>s+p.x,0)/allWorldPts.length;
     const cy = allWorldPts.reduce((s,p)=>s+p.y,0)/allWorldPts.length;
     const cz = allWorldPts.reduce((s,p)=>s+p.z,0)/allWorldPts.length;
@@ -1156,17 +1193,35 @@
       geom.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
       geom.computeVertexNormals();
       const mesh = new THREE.Mesh(geom, paperMaterial);
-      planeGroup.add(mesh);
+      group.add(mesh);
 
       const edgePos = [];
       worldPts.concat([worldPts[0]]).forEach(p=> edgePos.push(p.x,p.y,p.z));
       const edgeGeom = new THREE.BufferGeometry();
       edgeGeom.setAttribute('position', new THREE.Float32BufferAttribute(edgePos,3));
       const edges = new THREE.Line(edgeGeom, edgeMaterial);
-      planeGroup.add(edges);
+      group.add(edges);
 
-      panelMeshes.push({mesh, edges});
+      meshes.push({mesh, edges});
     });
+
+    return { group, meshes };
+  }
+
+  function disposeGroupDeep(obj){
+    obj.children.slice().forEach(disposeGroupDeep);
+    if(obj.geometry) obj.geometry.dispose();
+    if(obj.parent) obj.parent.remove(obj);
+  }
+
+  function render3D(){
+    if(typeof THREE==='undefined') return;
+    panelMeshes.forEach(m=>{ planeGroup.remove(m.mesh); planeGroup.remove(m.edges); m.mesh.geometry.dispose(); m.edges.geometry.dispose(); });
+    panelMeshes = [];
+
+    const built = buildAssembledMeshGroup(i => hinges[i].angle);
+    built.group.children.slice().forEach(child=>{ built.group.remove(child); planeGroup.add(child); });
+    panelMeshes = built.meshes;
 
     renderer3d.render(scene3d, camera3d);
   }
