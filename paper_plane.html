@@ -769,7 +769,123 @@
     const distance = Math.round(8 + score*40);
     const wobble = Math.round((1-symmetry)*20 + (1-massScore)*10);
 
-    return {score, distance, wobble, symmetry, noseScore, elongationScore, massScore, massFrac, mainAxisX};
+    return {score, distance, wobble, symmetry, noseScore, elongationScore, massScore, massFrac, mainAxisX, minX, maxX, minY, maxY};
+  }
+
+  // ---------- extended (3D) aerodynamics — Пункт 2 дополнения ----------
+  // Everything above stays 2D and is the "dart" baseline the spec asks to
+  // keep. These add the parameters that only exist once the paper has real
+  // 3D structure: dihedral (how far the panels the player folded are
+  // currently sprung open, via the Раскрытие slider from Пункт 1), wing
+  // aspect ratio and wing loading (from each panel's true vs top-down
+  // projected area), and a center-of-gravity that actually accounts for
+  // stacked layers (overlapping panels each pull the weighted centroid
+  // toward themselves, so a point with 3 layers counts 3x — no separate
+  // "layer count" grid needed).
+  //
+  // There's no per-panel "this is a wing" flag — a panel that has never
+  // moved (hingeChain empty) is treated as the untouched fuselage/keel;
+  // everything that resulted from at least one fold is treated as a
+  // "carrying" panel and pooled by area. This is a deliberate
+  // simplification: it matches the common case where the folds you make
+  // ARE the wings, and keeps the model from needing the player to mark
+  // anything by hand — see the module comment above computeAerodynamics3D.
+  const GLIDER_MAX_LOADING = 2.2;   // total paper area / projected wing area
+  const GLIDER_MIN_AR = 1.0;        // wingspan^2 / projected wing area
+  const GLIDER_MIN_DIHEDRAL = 2;    // degrees; spec: <=0 means dart-only
+
+  function computeAerodynamics3D(pts, base){
+    const { mainAxisX, minX, maxX, minY, maxY } = base;
+    const getAngle = i => hinges[i].angle;
+    const axes = computeWorldAxesWithAngles(getAngle);
+    const flatTotalArea = polygonArea(startShape());
+
+    let massSumX=0, massSumY=0, massWeight=0;
+    let wingFlatArea=0, wingProjArea=0;
+    let wingMinSpan=Infinity, wingMaxSpan=-Infinity;
+    let dihedralWeighted=0, dihedralWeight=0;
+
+    panels.forEach(panel=>{
+      const flatArea = polygonArea(panel.poly2d);
+      if(flatArea<1e-6) return;
+      const world = panel.poly2d.map(pt=> pointFromChainWithAxes(pt, panel.hingeChain, axes, getAngle));
+      const proj = world.map(p=>({x:p.x, y:p.y})); // top-down projection, ignoring z
+
+      const centroid = polygonCentroid(proj);
+      massSumX += centroid.x*flatArea;
+      massSumY += centroid.y*flatArea;
+      massWeight += flatArea;
+
+      if(panel.hingeChain.length>0){
+        const projArea = polygonArea(proj);
+        wingFlatArea += flatArea;
+        wingProjArea += projArea;
+        proj.forEach(p=>{
+          const spanCoord = mainAxisX ? p.y : p.x;
+          wingMinSpan = Math.min(wingMinSpan, spanCoord);
+          wingMaxSpan = Math.max(wingMaxSpan, spanCoord);
+        });
+        const lastHinge = hinges[panel.hingeChain[panel.hingeChain.length-1]];
+        const localDihedral = Math.max(0, 180-lastHinge.angle);
+        dihedralWeighted += localDihedral*flatArea;
+        dihedralWeight += flatArea;
+      }
+    });
+
+    const massCentroid = massWeight>0 ? {x:massSumX/massWeight, y:massSumY/massWeight} : polygonCentroid(pts);
+    const alongNose = mainAxisX ? minX : minY;
+    const alongTail = mainAxisX ? maxX : maxY;
+    const alongCentroid = mainAxisX ? massCentroid.x : massCentroid.y;
+    const massFrac = (alongCentroid - alongNose) / ((alongTail-alongNose) || 1);
+    const idealMassFrac = 0.44;
+    const massScore = Math.max(0, Math.min(1, 1 - Math.abs(massFrac-idealMassFrac)/idealMassFrac));
+
+    const wingSpan = wingMaxSpan>wingMinSpan ? wingMaxSpan-wingMinSpan : 0;
+    const aspectRatio = wingProjArea>1 ? (wingSpan*wingSpan)/wingProjArea : 0;
+    const wingLoading = wingProjArea>1 ? flatTotalArea/wingProjArea : Infinity;
+    const dihedralDeg = dihedralWeight>0 ? dihedralWeighted/dihedralWeight : 0;
+
+    return { massScore, massFrac, aspectRatio, wingLoading, dihedralDeg, wingFlatArea, wingProjArea };
+  }
+
+  // Two flight regimes: a dart flies an almost-pure parabola driven mostly
+  // by nose sharpness and symmetry (the original Модуль 4 formula); a
+  // glider additionally rewards low wing loading, a sensible dihedral and
+  // a healthy aspect ratio with extra distance and less wobble. Which one
+  // applies depends entirely on the CURRENT spread — the same folded model
+  // reads as a dart until its wings are actually sprung open.
+  function evaluateFlight3D(pts){
+    const base = evaluateFlight(pts);
+    const aero = computeAerodynamics3D(pts, base);
+
+    const isGlider = aero.dihedralDeg > GLIDER_MIN_DIHEDRAL
+      && aero.wingLoading < GLIDER_MAX_LOADING
+      && aero.aspectRatio > GLIDER_MIN_AR;
+
+    const dartScore = 0.32*base.symmetry + 0.24*base.noseScore + 0.24*base.elongationScore + 0.20*aero.massScore;
+
+    // Gliding is a BONUS mechanic layered on top of the dart baseline, never
+    // a penalty: a plane that barely qualifies as a glider (glideScore near
+    // 0 right at the threshold) should fly almost exactly like the same
+    // plane just below the threshold would as a dart — no cliff at the
+    // boundary — and only a genuinely well-tuned glide configuration should
+    // meaningfully outperform the dart baseline.
+    let glideScore = 0;
+    if(isGlider){
+      const idealDihedral = 10;
+      const dihedralScore = Math.max(0, 1 - Math.abs(aero.dihedralDeg-idealDihedral)/20);
+      const loadingScore = Math.max(0, Math.min(1, (GLIDER_MAX_LOADING-aero.wingLoading)/GLIDER_MAX_LOADING));
+      const arScore = Math.max(0, Math.min(1, (aero.aspectRatio-GLIDER_MIN_AR)/2));
+      glideScore = 0.45*dihedralScore + 0.30*loadingScore + 0.25*arScore;
+    }
+
+    const score = dartScore;
+    const distance = Math.round(8 + dartScore*40 + glideScore*22);
+    const wobble = Math.max(0, Math.round((1-base.symmetry)*20 + (1-aero.massScore)*10 - glideScore*6));
+
+    return Object.assign({}, base, aero, {
+      isGlider, flightMode: isGlider?'glider':'dart', dartScore, glideScore, score, distance, wobble
+    });
   }
 
   function updateReadout(text){
@@ -778,7 +894,7 @@
 
   // ---------- slope test animation ----------
   function runSlopeTest(){
-    const result = evaluateFlight(shape);
+    const result = evaluateFlight3D(shape);
     updateReadout('Запуск...');
 
     ctx.clearRect(0,0,W,H);
@@ -849,7 +965,8 @@
       if(t<1){
         requestAnimationFrame(frame);
       } else {
-        updateReadout(`Дальность полёта: ${result.distance} м  •  симметрия: ${Math.round(result.symmetry*100)}%  •  острота носа: ${Math.round(result.noseScore*100)}%  •  баланс массы: ${Math.round(result.massScore*100)}%`);
+        const modeLabel = result.isGlider ? 'планер' : 'дротик';
+        updateReadout(`Дальность полёта: ${result.distance} м  •  режим: ${modeLabel}  •  симметрия: ${Math.round(result.symmetry*100)}%  •  V-образность: ${Math.round(result.dihedralDeg)}°  •  удлинение крыла: ${result.aspectRatio.toFixed(2)}  •  нагрузка на крыло: ${Number.isFinite(result.wingLoading) ? result.wingLoading.toFixed(2) : '—'}`);
       }
     }
     requestAnimationFrame(frame);
